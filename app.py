@@ -7,12 +7,12 @@ from openpyxl.worksheet.datavalidation import DataValidation
 import pypdf
 import re
 import io
+import os
 
 st.set_page_config(page_title="発注確定版 自動生成ツール", layout="wide")
 st.title("📦 発注予定表 × ピッキング確定 突合生成システム")
-st.caption("Excel予定表とPDFをアップロードするだけで、確定値の反映・出荷集約（配送区分判定）・商品別集計・フィルタ設定・列幅調整を行います。")
+st.caption("Excel予定表とPDFをアップロードするだけで、マクロが最初から実装された確定版（.xlsm）を出力します。")
 
-# スタイル定義
 YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 MEIRYO_FONT = Font(name="Meiryo UI", size=10)
 MEIRYO_HEADER_FONT = Font(name="Meiryo UI", size=10, bold=True)
@@ -63,7 +63,7 @@ def parse_picking_pdf(file_bytes):
             i += 1
     return pd.DataFrame(records)
 
-def auto_fit_columns(ws, max_cols=10):
+def auto_fit_columns(ws, max_cols=6):
     for col in range(1, max_cols + 1):
         col_letter = get_column_letter(col)
         max_len = 0
@@ -71,38 +71,48 @@ def auto_fit_columns(ws, max_cols=10):
             val = ws.cell(r, col).value
             if val is not None:
                 s_val = str(val)
-                # 全角文字を考慮した文字幅計算
                 val_len = sum(2 if ord(ch) > 127 else 1 for ch in s_val)
                 if val_len > max_len:
                     max_len = val_len
         ws.column_dimensions[col_letter].width = max(max_len + 3, 11)
 
 def process_data(excel_file, apita_pdf, donki_pdf):
-    try:
-        wb = openpyxl.load_workbook(excel_file, data_only=False)
-    except Exception:
-        excel_file.seek(0)
-        xls_all = pd.read_excel(excel_file, sheet_name=None, header=None)
+    # 1. 予定表の全シートを読み込み
+    xls_all = pd.read_excel(excel_file, sheet_name=None, header=None)
+    
+    # 2. マクロテンプレートが存在すればマクロ保持（keep_vba=True）で読み込み
+    if os.path.exists("template.xlsm"):
+        wb = openpyxl.load_workbook("template.xlsm", keep_vba=True)
+    else:
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
-        for s_name, s_df in xls_all.items():
-            new_ws = wb.create_sheet(title=s_name)
-            for r_row in s_df.itertuples(index=False):
-                new_ws.append(list(r_row))
-    
+        
+    # 既存の余分なシートを削除
+    for sname in list(wb.sheetnames):
+        if sname not in ["ルート", "店舗マスタ"]:
+            del wb[sname]
+            
+    # 予定表からシートを再生成
     date_sheet_name = None
-    for name in wb.sheetnames:
-        if name not in ["ルート", "店舗マスタ"]:
-            date_sheet_name = name
-            break
+    for s_name, s_df in xls_all.items():
+        if s_name not in ["ルート", "店舗マスタ"] and date_sheet_name is None:
+            date_sheet_name = s_name
+        if s_name in wb.sheetnames:
+            ws_tmp = wb[s_name]
+            for row in ws_tmp.iter_rows():
+                for cell in row:
+                    cell.value = None
+        else:
+            ws_tmp = wb.create_sheet(title=s_name)
+        for r_row in s_df.itertuples(index=False):
+            ws_tmp.append(list(r_row))
+            
     ws = wb[date_sheet_name]
     
-    # 既存のB1セル日付を取得
     raw_date_val = ws.cell(1, 2).value
     if not raw_date_val:
         raw_date_val = ws.cell(1, 3).value
     
-    # 曜日判定（ルートの配送区分参照用）
     date_clean = str(raw_date_val)
     if " " in date_clean:
         date_clean = date_clean.split(" ")[0]
@@ -111,11 +121,10 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         
     try:
         target_dt = pd.to_datetime(date_clean)
-        is_thursday = (target_dt.weekday() == 3) # 3:木曜日
+        is_thursday = (target_dt.weekday() == 3)
     except:
         is_thursday = False
 
-    # ルートシートから店舗別の配送区分（自社 / 佐川）を辞書化
     dist_map = {}
     ws_route = None
     for r_name in ["ルート", "店舗マスタ"]:
@@ -124,7 +133,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             break
             
     if ws_route:
-        # 木曜日: D列(店番), F列(配送区分) / 火・土: A列(店番), C列(配送区分)
         c_code = 4 if is_thursday else 1
         c_dist = 6 if is_thursday else 3
         for r in range(1, ws_route.max_row + 1):
@@ -138,9 +146,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                 except:
                     pass
 
-    # -------------------------------------------------------------
-    # 1. レイアウト正規化（A列に「採用」がない場合は1列挿入）
-    # -------------------------------------------------------------
+    # A列採用挿入
     if ws.cell(2, 1).value != "採用":
         ws.insert_cols(1)
         ws.cell(2, 1).value = "採用"
@@ -151,9 +157,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws.cell(1, 2).value = raw_date_val
     ws.freeze_panes = "E3"
 
-    # -------------------------------------------------------------
-    # 2. PDF解析・マッピング準備
-    # -------------------------------------------------------------
     df_apita = parse_picking_pdf(apita_pdf.read())
     df_donki = parse_picking_pdf(donki_pdf.read())
     df_pdf = pd.concat([df_apita, df_donki], ignore_index=True)
@@ -162,7 +165,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     pdf_confirmed_stores = set(df_pdf["store_code"].unique())
     pdf_qty_dict = {(row["store_code"], row["item_code"]): row["qty"] for _, row in df_pdf.iterrows()}
 
-    # 店舗列マッピング
     store_col_map = {}
     total_col_idx = None
     for c in range(5, ws.max_column + 1):
@@ -182,7 +184,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         total_col_idx = ws.max_column + 1
         ws.cell(2, total_col_idx).value = "総計"
 
-    # 商品行マッピング
     item_row_map = {}
     orig_totals = {}
     for r in range(3, ws.max_row + 1):
@@ -196,9 +197,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             except:
                 pass
 
-    # -------------------------------------------------------------
-    # 3. 未登録店舗・商品の追加
-    # -------------------------------------------------------------
     added_stores_list = []
     pdf_stores = df_pdf[["store_code", "store_name"]].drop_duplicates()
     for _, s_row in pdf_stores.iterrows():
@@ -231,12 +229,8 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     for r in range(3, current_last_row + 1):
         ws.cell(r, total_col_idx).value = f'=IF(AND(A{r}=TRUE,SUM(E{r}:{last_store_letter}{r})>0),SUM(E{r}:{last_store_letter}{r}),"")'
 
-    # 日付シートのフィルタ設定（2行目 A2〜D列または末尾）
     ws.auto_filter.ref = f"A2:{last_store_letter}{current_last_row}"
 
-    # -------------------------------------------------------------
-    # 4. PDF確定数量の反映・消去・色付け・差分ログ抽出
-    # -------------------------------------------------------------
     log_info = []
     diff_count = 0
     for sc, c_idx in store_col_map.items():
@@ -256,15 +250,12 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                         "store_name": ws.cell(2, c_idx).value, "old_qty": old_qty
                     })
 
-    # -------------------------------------------------------------
-    # 5. 「修正差分ログ」シート生成
-    # -------------------------------------------------------------
+    # 修正差分ログ
     if "修正差分ログ" in wb.sheetnames:
         del wb["修正差分ログ"]
     ws_log = wb.create_sheet(title="修正差分ログ")
     headers_log = ["シート", "店舗コード", "店舗名", "商品コード", "商品名", "修正前(予定)", "修正後(確定)", "増減"]
     ws_log.append(headers_log)
-    
     for log_idx, item in enumerate(log_info, start=2):
         r_i, c_i, sc, s_name, old_q = item["r_idx"], item["c_idx"], item["store_code"], item["store_name"], item["old_qty"]
         col_letter = get_column_letter(c_i)
@@ -282,13 +273,10 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws_log.auto_filter.ref = f"A1:H{max(ws_log.max_row, 2)}"
     ws_log.views.sheetView[0].showZeros = False
 
-    # -------------------------------------------------------------
-    # 6. 「出荷集約」シート生成（ルート配送区分判定連動）
-    # -------------------------------------------------------------
+    # 出荷集約
     if "出荷集約" in wb.sheetnames:
         del wb["出荷集約"]
     ws_syukka = wb.create_sheet(title="出荷集約")
-    
     ws_syukka.cell(1, 1).value = "【対象日付】"
     ws_syukka.cell(1, 2).value = f"='{date_sheet_name}'!B1"
     ws_syukka.cell(2, 1).value = "【表示モード】"
@@ -312,31 +300,23 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws_syukka.cell(idx, 2).value = f"=IF(A{idx}=TRUE, '{date_sheet_name}'!B{r}, \"\")"
         ws_syukka.cell(idx, 3).value = f"=IF(A{idx}=TRUE, '{date_sheet_name}'!C{r}, \"\")"
         ws_syukka.cell(idx, 4).value = f"=IF(A{idx}=TRUE, '{date_sheet_name}'!D{r}, \"\")"
-        
         for c in range(5, total_col_idx):
             col_letter = get_column_letter(c)
             sc_key = str(ws.cell(1, c).value).strip() if ws.cell(1, c).value else ""
-            dist_target = dist_map.get(sc_key, "自社便のみ") # ルートから取得した区分
-            
+            dist_target = dist_map.get(sc_key, "自社便のみ")
             ws_syukka.cell(idx, c).value = f'=IF(AND(A{idx}=TRUE, \'{date_sheet_name}\'!$A{r}=TRUE, OR($B$2="すべて表示", $B$2="{dist_target}"), \'{date_sheet_name}\'!{col_letter}{r}>0), \'{date_sheet_name}\'!{col_letter}{r}, "")'
-            
         ws_syukka.cell(idx, total_col_idx).value = f'=IF(AND(A{idx}=TRUE, SUM(E{idx}:{last_store_letter}{idx})>0), SUM(E{idx}:{last_store_letter}{idx}), "")'
 
     ws_syukka.freeze_panes = "E5"
-    # 出荷集約のフィルタ設定（4行目 A4〜D4）
     ws_syukka.auto_filter.ref = f"A4:D{current_last_row + 2}"
     ws_syukka.views.sheetView[0].showZeros = False
 
-    # -------------------------------------------------------------
-    # 7. 「商品別集計」シート生成
-    # -------------------------------------------------------------
+    # 商品別集計
     if "商品別集計" in wb.sheetnames:
         del wb["商品別集計"]
     ws_shouhin = wb.create_sheet(title="商品別集計")
-    
     ws_shouhin.cell(1, 1).value = "【対象日付】"
     ws_shouhin.cell(1, 2).value = f"='{date_sheet_name}'!B1"
-    
     ws_shouhin.cell(3, 1).value = "商品コード"
     ws_shouhin.cell(3, 2).value = "商品名"
     ws_shouhin.cell(3, 3).value = "納品単価"
@@ -349,7 +329,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ic_val = ws.cell(r, 2).value
         ic_str = str(int(float(str(ic_val)))) if ic_val else ""
         before_qty = orig_totals.get(ic_str, 0)
-        
         ws_shouhin.cell(idx, 1).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, '{date_sheet_name}'!B{r}, \"\")"
         ws_shouhin.cell(idx, 2).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, '{date_sheet_name}'!C{r}, \"\")"
         ws_shouhin.cell(idx, 3).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, '{date_sheet_name}'!D{r}, \"\")"
@@ -359,13 +338,10 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws_shouhin.cell(idx, 6).number_format = DIFF_NUM_FORMAT
 
     ws_shouhin.freeze_panes = "A4"
-    # 商品別集計のフィルタ設定（3行目 A3〜F3）
     ws_shouhin.auto_filter.ref = f"A3:F{current_last_row + 1}"
     ws_shouhin.views.sheetView[0].showZeros = False
 
-    # -------------------------------------------------------------
-    # 8. 全シート Meiryo UI 適用 ＆ 列幅自動調整
-    # -------------------------------------------------------------
+    # Meiryo UI適用 ＆ 列幅調整
     for sheet_name in wb.sheetnames:
         target_ws = wb[sheet_name]
         for row in target_ws.iter_rows():
@@ -373,7 +349,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                 if cell.value is not None:
                     is_bold = (cell.row in [1, 2, 3, 4] and cell.value in ["採用", "コード", "商品名", "納品単価", "総計", "商品コード", "確定前総数", "確定後総数", "差異", "シート", "店舗コード", "店舗名", "修正前(予定)", "修正後(確定)", "増減"])
                     cell.font = MEIRYO_HEADER_FONT if is_bold else MEIRYO_FONT
-        # 主要列の幅を自動調整
         auto_fit_columns(target_ws, max_cols=6)
 
     output = io.BytesIO()
@@ -391,10 +366,10 @@ with col3:
 
 if f_excel and f_apita and f_donki:
     st.markdown("---")
-    if st.button("🚀 突合処理を実行して確定版Excelを作成", type="primary", use_container_width=True):
-        with st.spinner("PDF解析・差分突合・配送区分連動・書式設定中..."):
+    if st.button("🚀 突合処理を実行してマクロ入り確定版を作成", type="primary", use_container_width=True):
+        with st.spinner("PDF解析・差分突合・マクロ埋め込み中..."):
             out_bytes, diff_cnt, add_items, add_stores = process_data(f_excel, f_apita, f_donki)
-            st.success("🎉 突合処理および全シートの生成・フォーマット適用が完了しました！")
+            st.success("🎉 マクロ入り確定版エクセルの生成が完了しました！")
             
             m1, m2, m3 = st.columns(3)
             m1.metric("修正セル数（着色・消去含む）", f"{diff_cnt} 件")
@@ -411,9 +386,9 @@ if f_excel and f_apita and f_donki:
                         st.write(f"- {st_name}")
             
             st.download_button(
-                label="📥 【確定修正版】発注表.xlsx をダウンロード",
+                label="📥 【確定修正版】発注表.xlsm をダウンロード（マクロ有効）",
                 data=out_bytes,
-                file_name="【確定修正版】発注表.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                file_name="【確定修正版】発注表.xlsm",
+                mime="application/vnd.ms-excel.sheet.macroEnabled.12",
                 use_container_width=True
             )
