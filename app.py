@@ -11,13 +11,16 @@ import os
 
 st.set_page_config(page_title="発注確定版 自動生成ツール", layout="wide")
 st.title("📦 発注予定表 × ピッキング確定 突合生成システム")
-st.caption("Excel予定表とPDFをアップロードするだけで、マクロが最初から実装された確定版（.xlsm）を出力します。")
+st.caption("予定表とPDFを突合し、未登録商品・店舗の自動追加、確定数量反映、動的連動ログ、マクロ内蔵の確定版（.xlsm）を出力します。")
 
 YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 MEIRYO_FONT = Font(name="Meiryo UI", size=10)
 MEIRYO_HEADER_FONT = Font(name="Meiryo UI", size=10, bold=True)
 DIFF_NUM_FORMAT = '#,##0;[Red]-#,##0;""'
 
+# -------------------------------------------------------------
+# 1. PDF解析関数 (アピタ・ドンキ共通)
+# -------------------------------------------------------------
 def parse_picking_pdf(file_bytes):
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
     records = []
@@ -32,12 +35,14 @@ def parse_picking_pdf(file_bytes):
         i = 0
         while i < len(lines):
             line = lines[i]
+            # 納入先（店舗コード・店舗名）の抽出
             if "納入先：" in line:
                 m = re.search(r"納入先：\s*(\d+)\s*(.*)", line)
                 if m:
                     current_store_code = str(int(m.group(1)))
                     current_store_name = m.group(2).strip()
             
+            # 商品明細（8桁コード・商品名・単価・数量）の抽出
             m_item = re.match(r"^(\d{8})\s+(.*)", line)
             if m_item and current_store_code:
                 item_code = str(int(m_item.group(1)))
@@ -63,6 +68,9 @@ def parse_picking_pdf(file_bytes):
             i += 1
     return pd.DataFrame(records)
 
+# -------------------------------------------------------------
+# 2. 列幅の自動調整
+# -------------------------------------------------------------
 def auto_fit_columns(ws, max_cols=6):
     for col in range(1, max_cols + 1):
         col_letter = get_column_letter(col)
@@ -76,23 +84,23 @@ def auto_fit_columns(ws, max_cols=6):
                     max_len = val_len
         ws.column_dimensions[col_letter].width = max(max_len + 3, 11)
 
+# -------------------------------------------------------------
+# 3. メイン処理（突合 ＆ エクセル再構築）
+# -------------------------------------------------------------
 def process_data(excel_file, apita_pdf, donki_pdf):
-    # 1. 予定表の全シートを読み込み
     xls_all = pd.read_excel(excel_file, sheet_name=None, header=None)
     
-    # 2. マクロテンプレートが存在すればマクロ保持（keep_vba=True）で読み込み
+    # template.xlsm（マクロ有効ブック）をベースに読み込み
     if os.path.exists("template.xlsm"):
         wb = openpyxl.load_workbook("template.xlsm", keep_vba=True)
     else:
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
         
-    # 既存の余分なシートを削除
     for sname in list(wb.sheetnames):
         if sname not in ["ルート", "店舗マスタ"]:
             del wb[sname]
             
-    # 予定表からシートを再生成
     date_sheet_name = None
     for s_name, s_df in xls_all.items():
         if s_name not in ["ルート", "店舗マスタ"] and date_sheet_name is None:
@@ -109,6 +117,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             
     ws = wb[date_sheet_name]
     
+    # 納品日の判定
     raw_date_val = ws.cell(1, 2).value
     if not raw_date_val:
         raw_date_val = ws.cell(1, 3).value
@@ -125,6 +134,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     except:
         is_thursday = False
 
+    # ルートシートから配送区分を取得
     dist_map = {}
     ws_route = None
     for r_name in ["ルート", "店舗マスタ"]:
@@ -146,7 +156,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                 except:
                     pass
 
-    # A列採用挿入
+    # A列に「採用」フラグがなければ挿入
     if ws.cell(2, 1).value != "採用":
         ws.insert_cols(1)
         ws.cell(2, 1).value = "採用"
@@ -157,6 +167,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws.cell(1, 2).value = raw_date_val
     ws.freeze_panes = "E3"
 
+    # PDFの解析とマージ
     df_apita = parse_picking_pdf(apita_pdf.read())
     df_donki = parse_picking_pdf(donki_pdf.read())
     df_pdf = pd.concat([df_apita, df_donki], ignore_index=True)
@@ -165,6 +176,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     pdf_confirmed_stores = set(df_pdf["store_code"].unique())
     pdf_qty_dict = {(row["store_code"], row["item_code"]): row["qty"] for _, row in df_pdf.iterrows()}
 
+    # 店舗列のマッピング
     store_col_map = {}
     total_col_idx = None
     for c in range(5, ws.max_column + 1):
@@ -184,6 +196,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         total_col_idx = ws.max_column + 1
         ws.cell(2, total_col_idx).value = "総計"
 
+    # 商品行のマッピング
     item_row_map = {}
     orig_totals = {}
     for r in range(3, ws.max_row + 1):
@@ -197,6 +210,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             except:
                 pass
 
+    # 未登録店舗の追加（総計列の前に追加）
     added_stores_list = []
     pdf_stores = df_pdf[["store_code", "store_name"]].drop_duplicates()
     for _, s_row in pdf_stores.iterrows():
@@ -210,6 +224,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             added_stores_list.append(f"{sc} ({s_row['store_name']})")
             total_col_idx += 1
 
+    # 未登録商品の追加（最終行に追加）
     added_items_list = []
     pdf_items = df_pdf[["item_code", "item_name", "price"]].drop_duplicates(subset=["item_code"])
     current_last_row = ws.max_row
@@ -231,6 +246,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
 
     ws.auto_filter.ref = f"A2:{last_store_letter}{current_last_row}"
 
+    # 差分の突合 ＆ 日付シートへの反映
     log_info = []
     diff_count = 0
     for sc, c_idx in store_col_map.items():
@@ -245,35 +261,54 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                     target_cell.value = new_qty if new_qty > 0 else None
                     target_cell.fill = YELLOW_FILL
                     diff_count += 1
+                    
                     log_info.append({
-                        "r_idx": r_idx, "c_idx": c_idx, "store_code": sc,
-                        "store_name": ws.cell(2, c_idx).value, "old_qty": old_qty
+                        "sheet": date_sheet_name,
+                        "store_code": sc,
+                        "store_name": ws.cell(2, c_idx).value,
+                        "item_code": ws.cell(r_idx, 2).value,
+                        "item_name": ws.cell(r_idx, 3).value,
+                        "old_qty": old_qty
                     })
 
-    # 修正差分ログ
+    # -------------------------------------------------------------
+    # 修正差分ログシートの再構築（動的INDEX+MATCH数式リンク）
+    # -------------------------------------------------------------
     if "修正差分ログ" in wb.sheetnames:
         del wb["修正差分ログ"]
     ws_log = wb.create_sheet(title="修正差分ログ")
     headers_log = ["シート", "店舗コード", "店舗名", "商品コード", "商品名", "修正前(予定)", "修正後(確定)", "増減"]
     ws_log.append(headers_log)
+    
+    last_store_col_letter = get_column_letter(total_col_idx - 1)
+    
     for log_idx, item in enumerate(log_info, start=2):
-        r_i, c_i, sc, s_name, old_q = item["r_idx"], item["c_idx"], item["store_code"], item["store_name"], item["old_qty"]
-        col_letter = get_column_letter(c_i)
-        ws_log.cell(log_idx, 1).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{date_sheet_name}\", \"\")"
-        ws_log.cell(log_idx, 2).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{sc}\", \"\")"
-        ws_log.cell(log_idx, 3).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{s_name}\", \"\")"
-        ws_log.cell(log_idx, 4).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, '{date_sheet_name}'!B{r_i}, \"\")"
-        ws_log.cell(log_idx, 5).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, '{date_sheet_name}'!C{r_i}, \"\")"
-        ws_log.cell(log_idx, 6).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, {old_q}, \"\")"
-        ws_log.cell(log_idx, 7).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, IF('{date_sheet_name}'!{col_letter}{r_i}=\"\", 0, '{date_sheet_name}'!{col_letter}{r_i}), \"\")"
-        ws_log.cell(log_idx, 8).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, G{log_idx}-F{log_idx}, \"\")"
+        ws_log.cell(log_idx, 1).value = item["sheet"]
+        ws_log.cell(log_idx, 2).value = item["store_code"]
+        ws_log.cell(log_idx, 3).value = item["store_name"]
+        ws_log.cell(log_idx, 4).value = item["item_code"]
+        ws_log.cell(log_idx, 5).value = item["item_name"]
+        ws_log.cell(log_idx, 6).value = item["old_qty"]
+        
+        # 店舗列がマクロで並び替わっても自動追従する2次元検索式
+        ws_log.cell(log_idx, 7).value = (
+            f"=IF($B{log_idx}=\"\", \"\", "
+            f"IFERROR(INDEX('{date_sheet_name}'!$E$3:${last_store_col_letter}${current_last_row}, "
+            f"MATCH($D{log_idx}, '{date_sheet_name}'!$B$3:$B${current_last_row}, 0), "
+            f"MATCH($B{log_idx}, '{date_sheet_name}'!$E$1:${last_store_col_letter}$1, 0)), 0))"
+        )
+        
+        # 増減（修正後 - 修正前）
+        ws_log.cell(log_idx, 8).value = f"=IF($B{log_idx}=\"\", \"\", G{log_idx}-F{log_idx})"
         ws_log.cell(log_idx, 8).number_format = DIFF_NUM_FORMAT
 
     ws_log.freeze_panes = "A2"
     ws_log.auto_filter.ref = f"A1:H{max(ws_log.max_row, 2)}"
     ws_log.views.sheetView[0].showZeros = False
 
-    # 出荷集約
+    # -------------------------------------------------------------
+    # 出荷集約シートの再構築
+    # -------------------------------------------------------------
     if "出荷集約" in wb.sheetnames:
         del wb["出荷集約"]
     ws_syukka = wb.create_sheet(title="出荷集約")
@@ -311,7 +346,9 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws_syukka.auto_filter.ref = f"A4:D{current_last_row + 2}"
     ws_syukka.views.sheetView[0].showZeros = False
 
-    # 商品別集計
+    # -------------------------------------------------------------
+    # 商品別集計シートの再構築
+    # -------------------------------------------------------------
     if "商品別集計" in wb.sheetnames:
         del wb["商品別集計"]
     ws_shouhin = wb.create_sheet(title="商品別集計")
@@ -341,7 +378,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws_shouhin.auto_filter.ref = f"A3:F{current_last_row + 1}"
     ws_shouhin.views.sheetView[0].showZeros = False
 
-    # Meiryo UI適用 ＆ 列幅調整
+    # フォント・列幅統一
     for sheet_name in wb.sheetnames:
         target_ws = wb[sheet_name]
         for row in target_ws.iter_rows():
@@ -355,7 +392,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     wb.save(output)
     return output.getvalue(), diff_count, added_items_list, added_stores_list
 
-# UI
+# UI構成
 col1, col2, col3 = st.columns(3)
 with col1:
     f_excel = st.file_uploader("① 発注予定表 (.xls / .xlsx)", type=["xls", "xlsx"])
