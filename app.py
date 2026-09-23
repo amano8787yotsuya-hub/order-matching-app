@@ -10,7 +10,7 @@ import io
 
 st.set_page_config(page_title="発注確定版 自動生成ツール", layout="wide")
 st.title("📦 発注予定表 × ピッキング確定 突合生成システム")
-st.caption("Excel予定表とPDFをアップロードするだけで、確定値の反映（色付け）・出荷集約・商品別集計・差分ログ関数化・全シートメイリオ統一を行います。")
+st.caption("Excel予定表とPDFをアップロードするだけで、確定値の反映（消去・色付け含む）・出荷集約・商品別集計・差分ログ関数化を行います。")
 
 # スタイル定義
 YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
@@ -109,6 +109,13 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     df_pdf = pd.concat([df_apita, df_donki], ignore_index=True)
     df_pdf = df_pdf.drop_duplicates(subset=["store_code", "item_code"], keep="last")
     
+    # PDFに存在する店舗コードの集合（この店舗群はPDFが確定全件）
+    pdf_confirmed_stores = set(df_pdf["store_code"].unique())
+    # PDFの確定数量辞書 {(store_code, item_code): qty}
+    pdf_qty_dict = {}
+    for _, row in df_pdf.iterrows():
+        pdf_qty_dict[(row["store_code"], row["item_code"])] = row["qty"]
+
     # 店舗列マッピング
     store_col_map = {}
     total_col_idx = None
@@ -187,34 +194,35 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws.cell(r, total_col_idx).value = f'=IF(AND(A{r}=TRUE,SUM(E{r}:{last_store_letter}{r})>0),SUM(E{r}:{last_store_letter}{r}),"")'
 
     # -------------------------------------------------------------
-    # 5. PDF確定数量の反映・色付け・差分ログ作成準備
+    # 5. PDF確定数量の反映・消去・色付け・差分ログ抽出
     # -------------------------------------------------------------
-    log_info = [] # {r_idx, c_idx, store_code, store_name, old_qty}
+    log_info = []
     diff_count = 0
-    for _, row in df_pdf.iterrows():
-        sc = row["store_code"]
-        ic = row["item_code"]
-        pdf_qty = row["qty"]
-        r_idx = item_row_map.get(ic)
-        c_idx = store_col_map.get(sc)
-        
-        if r_idx and c_idx:
-            old_val = ws.cell(r_idx, c_idx).value
-            old_qty = int(old_val) if (old_val is not None and str(old_val).isdigit()) else 0
-            
-            if old_qty != pdf_qty:
-                target_cell = ws.cell(r_idx, c_idx)
-                target_cell.value = pdf_qty
-                target_cell.fill = YELLOW_FILL
-                diff_count += 1
+    
+    # 既存の店舗列 × 商品行をすべて走査
+    for sc, c_idx in store_col_map.items():
+        # PDFに対象店舗が存在する場合のみ確定突き合わせを実施
+        if sc in pdf_confirmed_stores:
+            for ic, r_idx in item_row_map.items():
+                old_val = ws.cell(r_idx, c_idx).value
+                old_qty = int(old_val) if (old_val is not None and str(old_val).isdigit()) else 0
                 
-                log_info.append({
-                    "r_idx": r_idx,
-                    "c_idx": c_idx,
-                    "store_code": sc,
-                    "store_name": ws.cell(2, c_idx).value,
-                    "old_qty": old_qty
-                })
+                # PDFに載っていればその数量、載っていなければ 0（消えたデータ）
+                new_qty = pdf_qty_dict.get((sc, ic), 0)
+                
+                if old_qty != new_qty:
+                    target_cell = ws.cell(r_idx, c_idx)
+                    target_cell.value = new_qty if new_qty > 0 else None
+                    target_cell.fill = YELLOW_FILL
+                    diff_count += 1
+                    
+                    log_info.append({
+                        "r_idx": r_idx,
+                        "c_idx": c_idx,
+                        "store_code": sc,
+                        "store_name": ws.cell(2, c_idx).value,
+                        "old_qty": old_qty
+                    })
 
     # -------------------------------------------------------------
     # 6. 「修正差分ログ」シートの生成（完全関数化 ＆ マイナス赤字）
@@ -233,7 +241,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         old_q = item["old_qty"]
         col_letter = get_column_letter(c_i)
         
-        # 添付ファイル通りの完全関数式
         ws_log.cell(log_idx, 1).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{date_sheet_name}\", \"\")"
         ws_log.cell(log_idx, 2).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{sc}\", \"\")"
         ws_log.cell(log_idx, 3).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{s_name}\", \"\")"
@@ -242,15 +249,13 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws_log.cell(log_idx, 6).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, {old_q}, \"\")"
         ws_log.cell(log_idx, 7).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, IF('{date_sheet_name}'!{col_letter}{r_i}=\"\", 0, '{date_sheet_name}'!{col_letter}{r_i}), \"\")"
         ws_log.cell(log_idx, 8).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, G{log_idx}-F{log_idx}, \"\")"
-        
-        # 増減列にマイナス赤文字・ゼロ非表示の書式を適用
         ws_log.cell(log_idx, 8).number_format = DIFF_NUM_FORMAT
 
     ws_log.freeze_panes = "A2"
     ws_log.views.sheetView[0].showZeros = False
 
     # -------------------------------------------------------------
-    # 7. 「出荷集約」シートの生成（数式連動・E5固定・プルダウン）
+    # 7. 「出荷集約」シートの生成
     # -------------------------------------------------------------
     if "出荷集約" in wb.sheetnames:
         del wb["出荷集約"]
@@ -288,7 +293,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws_syukka.views.sheetView[0].showZeros = False
 
     # -------------------------------------------------------------
-    # 8. 「商品別集計」シートの生成（数式連動・マイナス赤文字）
+    # 8. 「商品別集計」シートの生成
     # -------------------------------------------------------------
     if "商品別集計" in wb.sheetnames:
         del wb["商品別集計"]
@@ -316,8 +321,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws_shouhin.cell(idx, 4).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, {before_qty}, \"\")"
         ws_shouhin.cell(idx, 5).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, IF('{date_sheet_name}'!{total_col_letter}{r}=\"\", 0, '{date_sheet_name}'!{total_col_letter}{r}), \"\")"
         ws_shouhin.cell(idx, 6).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, E{idx}-D{idx}, \"\")"
-        
-        # 差異列にマイナス赤文字書式を適用
         ws_shouhin.cell(idx, 6).number_format = DIFF_NUM_FORMAT
 
     ws_shouhin.freeze_panes = "A4"
@@ -331,7 +334,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         for row in target_ws.iter_rows():
             for cell in row:
                 if cell.value is not None:
-                    # ヘッダー行のみ太字を保持
                     is_bold = (cell.row in [1, 2, 3, 4] and cell.value in ["採用", "コード", "商品名", "納品単価", "総計", "商品コード", "確定前総数", "確定後総数", "差異", "シート", "店舗コード", "店舗名", "修正前(予定)", "修正後(確定)", "増減"])
                     cell.font = MEIRYO_HEADER_FONT if is_bold else MEIRYO_FONT
 
@@ -351,12 +353,12 @@ with col3:
 if f_excel and f_apita and f_donki:
     st.markdown("---")
     if st.button("🚀 突合処理を実行して確定版Excelを作成", type="primary", use_container_width=True):
-        with st.spinner("PDF解析・差分突合・関数化・メイリオ適用中..."):
+        with st.spinner("PDF解析・差分突合（消去判定含む）・全シート生成中..."):
             out_bytes, diff_cnt, add_items, add_stores = process_data(f_excel, f_apita, f_donki)
-            st.success("🎉 突合および全シートの生成・フォーマット適用が完了しました！")
+            st.success("🎉 突合処理が完了しました！")
             
             m1, m2, m3 = st.columns(3)
-            m1.metric("修正セル数（黄色に着色）", f"{diff_cnt} 件")
+            m1.metric("修正セル数（着色・消去含む）", f"{diff_cnt} 件")
             m2.metric("新規追加商品", f"{len(add_items)} 件")
             m3.metric("新規追加店舗", f"{len(add_stores)} 店舗")
             
