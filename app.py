@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 import pypdf
@@ -10,9 +10,13 @@ import io
 
 st.set_page_config(page_title="発注確定版 自動生成ツール", layout="wide")
 st.title("📦 発注予定表 × ピッキング確定 突合生成システム")
-st.caption("Excel予定表とPDFをアップロードするだけで、確定値の反映（色付け）・出荷集約・商品別集計・枠固定・ゼロ非表示を完全生成します。")
+st.caption("Excel予定表とPDFをアップロードするだけで、確定値の反映（色付け）・出荷集約・商品別集計・差分ログ関数化・全シートメイリオ統一を行います。")
 
+# スタイル定義
 YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+MEIRYO_FONT = Font(name="Meiryo UI", size=10)
+MEIRYO_HEADER_FONT = Font(name="Meiryo UI", size=10, bold=True)
+DIFF_NUM_FORMAT = '#,##0;[Red]-#,##0;""'  # プラスは通常、マイナスは赤文字、ゼロは非表示
 
 def parse_picking_pdf(file_bytes):
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
@@ -94,10 +98,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             if ws.cell(r, 2).value is not None and str(ws.cell(r, 2).value).strip() != "":
                 ws.cell(r, 1).value = True
 
-    # B1セルに日付を確実に配置
     ws.cell(1, 2).value = raw_date_val
-
-    # 日付シートのウィンドウ枠固定：E3（A〜D列、1〜2行目を固定）
     ws.freeze_panes = "E3"
 
     # -------------------------------------------------------------
@@ -108,7 +109,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     df_pdf = pd.concat([df_apita, df_donki], ignore_index=True)
     df_pdf = df_pdf.drop_duplicates(subset=["store_code", "item_code"], keep="last")
     
-    # 店舗列マッピング (E列=5列目 〜)
+    # 店舗列マッピング
     store_col_map = {}
     total_col_idx = None
     for c in range(5, ws.max_column + 1):
@@ -128,7 +129,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         total_col_idx = ws.max_column + 1
         ws.cell(2, total_col_idx).value = "総計"
 
-    # 商品マッピング (B列=商品コード, 3行目〜)
+    # 商品行マッピング
     item_row_map = {}
     orig_totals = {}
     for r in range(3, ws.max_row + 1):
@@ -186,9 +187,9 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws.cell(r, total_col_idx).value = f'=IF(AND(A{r}=TRUE,SUM(E{r}:{last_store_letter}{r})>0),SUM(E{r}:{last_store_letter}{r}),"")'
 
     # -------------------------------------------------------------
-    # 5. PDF確定数量の反映・色付け・差分ログ作成
+    # 5. PDF確定数量の反映・色付け・差分ログ作成準備
     # -------------------------------------------------------------
-    log_records = []
+    log_info = [] # {r_idx, c_idx, store_code, store_name, old_qty}
     diff_count = 0
     for _, row in df_pdf.iterrows():
         sc = row["store_code"]
@@ -206,62 +207,73 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                 target_cell.value = pdf_qty
                 target_cell.fill = YELLOW_FILL
                 diff_count += 1
-                diff_val = pdf_qty - old_qty
-                log_records.append({
-                    "シート": date_sheet_name,
-                    "店舗コード": sc,
-                    "店舗名": ws.cell(2, c_idx).value,
-                    "商品コード": ic,
-                    "商品名": ws.cell(r_idx, 3).value,
-                    "修正前(予定)": old_qty if old_qty != 0 else "",
-                    "修正後(確定)": pdf_qty if pdf_qty != 0 else "",
-                    "増減": diff_val if diff_val != 0 else ""
+                
+                log_info.append({
+                    "r_idx": r_idx,
+                    "c_idx": c_idx,
+                    "store_code": sc,
+                    "store_name": ws.cell(2, c_idx).value,
+                    "old_qty": old_qty
                 })
 
-    # --- 修正差分ログシート ---
+    # -------------------------------------------------------------
+    # 6. 「修正差分ログ」シートの生成（完全関数化 ＆ マイナス赤字）
+    # -------------------------------------------------------------
     if "修正差分ログ" in wb.sheetnames:
         del wb["修正差分ログ"]
     ws_log = wb.create_sheet(title="修正差分ログ")
     headers_log = ["シート", "店舗コード", "店舗名", "商品コード", "商品名", "修正前(予定)", "修正後(確定)", "増減"]
     ws_log.append(headers_log)
-    for rec in log_records:
-        ws_log.append([rec[h] for h in headers_log])
     
-    # 1行目のみ固定 ＆ ゼロ値非表示設定
+    for log_idx, item in enumerate(log_info, start=2):
+        r_i = item["r_idx"]
+        c_i = item["c_idx"]
+        sc = item["store_code"]
+        s_name = item["store_name"]
+        old_q = item["old_qty"]
+        col_letter = get_column_letter(c_i)
+        
+        # 添付ファイル通りの完全関数式
+        ws_log.cell(log_idx, 1).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{date_sheet_name}\", \"\")"
+        ws_log.cell(log_idx, 2).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{sc}\", \"\")"
+        ws_log.cell(log_idx, 3).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, \"{s_name}\", \"\")"
+        ws_log.cell(log_idx, 4).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, '{date_sheet_name}'!B{r_i}, \"\")"
+        ws_log.cell(log_idx, 5).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, '{date_sheet_name}'!C{r_i}, \"\")"
+        ws_log.cell(log_idx, 6).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, {old_q}, \"\")"
+        ws_log.cell(log_idx, 7).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, IF('{date_sheet_name}'!{col_letter}{r_i}=\"\", 0, '{date_sheet_name}'!{col_letter}{r_i}), \"\")"
+        ws_log.cell(log_idx, 8).value = f"=IF('{date_sheet_name}'!$A{r_i}=TRUE, G{log_idx}-F{log_idx}, \"\")"
+        
+        # 増減列にマイナス赤文字・ゼロ非表示の書式を適用
+        ws_log.cell(log_idx, 8).number_format = DIFF_NUM_FORMAT
+
     ws_log.freeze_panes = "A2"
     ws_log.views.sheetView[0].showZeros = False
 
     # -------------------------------------------------------------
-    # 6. 「出荷集約」シートの生成
+    # 7. 「出荷集約」シートの生成（数式連動・E5固定・プルダウン）
     # -------------------------------------------------------------
     if "出荷集約" in wb.sheetnames:
         del wb["出荷集約"]
     ws_syukka = wb.create_sheet(title="出荷集約")
     
-    # B1セルに日付リンク
     ws_syukka.cell(1, 1).value = "【対象日付】"
     ws_syukka.cell(1, 2).value = f"='{date_sheet_name}'!B1"
-    
-    # B2セルにプルダウン設定
     ws_syukka.cell(2, 1).value = "【表示モード】"
     ws_syukka.cell(2, 2).value = "すべて表示"
+    
     dv = DataValidation(type="list", formula1='"すべて表示,自社便のみ,佐川便のみ"', allow_blank=True)
     ws_syukka.add_data_validation(dv)
     dv.add("B2")
     
-    # 3行目: 店舗コード
     for c in range(5, total_col_idx):
         ws_syukka.cell(3, c).value = ws.cell(1, c).value
-    # 4行目: ヘッダー
+        ws_syukka.cell(4, c).value = ws.cell(2, c).value
     ws_syukka.cell(4, 1).value = "採用"
     ws_syukka.cell(4, 2).value = "コード"
     ws_syukka.cell(4, 3).value = "商品名"
     ws_syukka.cell(4, 4).value = "納品単価"
-    for c in range(5, total_col_idx):
-        ws_syukka.cell(4, c).value = ws.cell(2, c).value
     ws_syukka.cell(4, total_col_idx).value = "総計"
     
-    # 5行目〜: 日付シートとリンク
     for idx, r in enumerate(range(3, current_last_row + 1), start=5):
         ws_syukka.cell(idx, 1).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, TRUE, FALSE)"
         ws_syukka.cell(idx, 2).value = f"=IF(A{idx}=TRUE, '{date_sheet_name}'!B{r}, \"\")"
@@ -272,18 +284,16 @@ def process_data(excel_file, apita_pdf, donki_pdf):
             ws_syukka.cell(idx, c).value = f'=IF(AND(A{idx}=TRUE, \'{date_sheet_name}\'!$A{r}=TRUE, OR($B$2="すべて表示", $B$2="自社便のみ"), \'{date_sheet_name}\'!{col_letter}{r}>0), \'{date_sheet_name}\'!{col_letter}{r}, "")'
         ws_syukka.cell(idx, total_col_idx).value = f'=IF(AND(A{idx}=TRUE, SUM(E{idx}:{last_store_letter}{idx})>0), SUM(E{idx}:{last_store_letter}{idx}), "")'
 
-    # 出荷集約のウィンドウ枠固定：E5（1〜4行目、A〜D列を固定）
     ws_syukka.freeze_panes = "E5"
     ws_syukka.views.sheetView[0].showZeros = False
 
     # -------------------------------------------------------------
-    # 7. 「商品別集計」シートの生成
+    # 8. 「商品別集計」シートの生成（数式連動・マイナス赤文字）
     # -------------------------------------------------------------
     if "商品別集計" in wb.sheetnames:
         del wb["商品別集計"]
     ws_shouhin = wb.create_sheet(title="商品別集計")
     
-    # B1セルに日付リンク
     ws_shouhin.cell(1, 1).value = "【対象日付】"
     ws_shouhin.cell(1, 2).value = f"='{date_sheet_name}'!B1"
     
@@ -303,12 +313,27 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws_shouhin.cell(idx, 1).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, '{date_sheet_name}'!B{r}, \"\")"
         ws_shouhin.cell(idx, 2).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, '{date_sheet_name}'!C{r}, \"\")"
         ws_shouhin.cell(idx, 3).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, '{date_sheet_name}'!D{r}, \"\")"
-        ws_shouhin.cell(idx, 4).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, IF({before_qty}=0, \"\", {before_qty}), \"\")"
-        ws_shouhin.cell(idx, 5).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, IF(OR('{date_sheet_name}'!{total_col_letter}{r}=\"\", '{date_sheet_name}'!{total_col_letter}{r}=0), \"\", '{date_sheet_name}'!{total_col_letter}{r}), \"\")"
-        ws_shouhin.cell(idx, 6).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, IF(E{idx}-D{idx}=0, \"\", E{idx}-D{idx}), \"\")"
+        ws_shouhin.cell(idx, 4).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, {before_qty}, \"\")"
+        ws_shouhin.cell(idx, 5).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, IF('{date_sheet_name}'!{total_col_letter}{r}=\"\", 0, '{date_sheet_name}'!{total_col_letter}{r}), \"\")"
+        ws_shouhin.cell(idx, 6).value = f"=IF('{date_sheet_name}'!$A{r}=TRUE, E{idx}-D{idx}, \"\")"
+        
+        # 差異列にマイナス赤文字書式を適用
+        ws_shouhin.cell(idx, 6).number_format = DIFF_NUM_FORMAT
 
     ws_shouhin.freeze_panes = "A4"
     ws_shouhin.views.sheetView[0].showZeros = False
+
+    # -------------------------------------------------------------
+    # 9. すべてのシートのフォントを「Meiryo UI」に一括適用
+    # -------------------------------------------------------------
+    for sheet_name in wb.sheetnames:
+        target_ws = wb[sheet_name]
+        for row in target_ws.iter_rows():
+            for cell in row:
+                if cell.value is not None:
+                    # ヘッダー行のみ太字を保持
+                    is_bold = (cell.row in [1, 2, 3, 4] and cell.value in ["採用", "コード", "商品名", "納品単価", "総計", "商品コード", "確定前総数", "確定後総数", "差異", "シート", "店舗コード", "店舗名", "修正前(予定)", "修正後(確定)", "増減"])
+                    cell.font = MEIRYO_HEADER_FONT if is_bold else MEIRYO_FONT
 
     output = io.BytesIO()
     wb.save(output)
@@ -326,9 +351,9 @@ with col3:
 if f_excel and f_apita and f_donki:
     st.markdown("---")
     if st.button("🚀 突合処理を実行して確定版Excelを作成", type="primary", use_container_width=True):
-        with st.spinner("PDF解析・差分突合・枠固定・集約シート生成中..."):
+        with st.spinner("PDF解析・差分突合・関数化・メイリオ適用中..."):
             out_bytes, diff_cnt, add_items, add_stores = process_data(f_excel, f_apita, f_donki)
-            st.success("🎉 突合および集約・集計シートの生成が完了しました！")
+            st.success("🎉 突合および全シートの生成・フォーマット適用が完了しました！")
             
             m1, m2, m3 = st.columns(3)
             m1.metric("修正セル数（黄色に着色）", f"{diff_cnt} 件")
