@@ -11,7 +11,7 @@ import os
 
 st.set_page_config(page_title="発注確定版 自動生成ツール", layout="wide")
 st.title("📦 発注予定表 × ピッキング確定 突合生成システム")
-st.caption("予定表とPDFを突合し、未登録商品・店舗の自動追加、確定数量反映、動的連動ログ、マクロ内蔵の確定版（.xlsm）を出力します。")
+st.caption("予定表とPDFを読み込み、未登録商品・店舗の自動追加、確定数量反映、マクロ内蔵の確定版（.xlsm）を出力します。")
 
 YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 MEIRYO_FONT = Font(name="Meiryo UI", size=10)
@@ -35,14 +35,14 @@ def parse_picking_pdf(file_bytes):
         i = 0
         while i < len(lines):
             line = lines[i]
-            # 納入先（店舗コード・店舗名）の抽出
+            # 納入先（店舗）の抽出
             if "納入先：" in line:
                 m = re.search(r"納入先：\s*(\d+)\s*(.*)", line)
                 if m:
                     current_store_code = str(int(m.group(1)))
                     current_store_name = m.group(2).strip()
             
-            # 商品明細（8桁コード・商品名・単価・数量）の抽出
+            # 商品明細の抽出
             m_item = re.match(r"^(\d{8})\s+(.*)", line)
             if m_item and current_store_code:
                 item_code = str(int(m_item.group(1)))
@@ -246,7 +246,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
 
     ws.auto_filter.ref = f"A2:{last_store_letter}{current_last_row}"
 
-    # 差分の突合 ＆ 日付シートへの反映
+    # 差分の突合 ＆ 反映（修正差分ログ用のレコードを収集）
     log_info = []
     diff_count = 0
     for sc, c_idx in store_col_map.items():
@@ -268,19 +268,19 @@ def process_data(excel_file, apita_pdf, donki_pdf):
                         "store_name": ws.cell(2, c_idx).value,
                         "item_code": ws.cell(r_idx, 2).value,
                         "item_name": ws.cell(r_idx, 3).value,
-                        "old_qty": old_qty
+                        "old_qty": old_qty,
+                        "new_qty": new_qty,
+                        "diff": new_qty - old_qty
                     })
 
     # -------------------------------------------------------------
-    # 修正差分ログシートの再構築（動的INDEX+MATCH数式リンク）
+    # 修正差分ログシートの再構築（値固定：並び替えでズレない設計）
     # -------------------------------------------------------------
     if "修正差分ログ" in wb.sheetnames:
         del wb["修正差分ログ"]
     ws_log = wb.create_sheet(title="修正差分ログ")
     headers_log = ["シート", "店舗コード", "店舗名", "商品コード", "商品名", "修正前(予定)", "修正後(確定)", "増減"]
     ws_log.append(headers_log)
-    
-    last_store_col_letter = get_column_letter(total_col_idx - 1)
     
     for log_idx, item in enumerate(log_info, start=2):
         ws_log.cell(log_idx, 1).value = item["sheet"]
@@ -289,22 +289,12 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         ws_log.cell(log_idx, 4).value = item["item_code"]
         ws_log.cell(log_idx, 5).value = item["item_name"]
         ws_log.cell(log_idx, 6).value = item["old_qty"]
-        
-        # 店舗列がマクロで並び替わっても自動追従する2次元検索式
-        ws_log.cell(log_idx, 7).value = (
-            f"=IF($B{log_idx}=\"\", \"\", "
-            f"IFERROR(INDEX('{date_sheet_name}'!$E$3:${last_store_col_letter}${current_last_row}, "
-            f"MATCH($D{log_idx}, '{date_sheet_name}'!$B$3:$B${current_last_row}, 0), "
-            f"MATCH($B{log_idx}, '{date_sheet_name}'!$E$1:${last_store_col_letter}$1, 0)), 0))"
-        )
-        
-        # 増減（修正後 - 修正前）
-        ws_log.cell(log_idx, 8).value = f"=IF($B{log_idx}=\"\", \"\", G{log_idx}-F{log_idx})"
+        ws_log.cell(log_idx, 7).value = item["new_qty"]
+        ws_log.cell(log_idx, 8).value = item["diff"]
         ws_log.cell(log_idx, 8).number_format = DIFF_NUM_FORMAT
 
     ws_log.freeze_panes = "A2"
     ws_log.auto_filter.ref = f"A1:H{max(ws_log.max_row, 2)}"
-    ws_log.views.sheetView[0].showZeros = False
 
     # -------------------------------------------------------------
     # 出荷集約シートの再構築
@@ -392,7 +382,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     wb.save(output)
     return output.getvalue(), diff_count, added_items_list, added_stores_list
 
-# UI構成
+# UI
 col1, col2, col3 = st.columns(3)
 with col1:
     f_excel = st.file_uploader("① 発注予定表 (.xls / .xlsx)", type=["xls", "xlsx"])
