@@ -1,0 +1,216 @@
+import streamlit as st
+import pandas as pd
+import openpyxl
+from openpyxl.utils import get_column_letter
+import pypdf
+import re
+import io
+
+st.set_page_config(page_title="発注確定版 自動生成ツール", layout="wide")
+st.title("📦 発注予定表 × ピッキング確定 突合生成システム")
+st.caption("Excel予定表とPDFをアップロードするだけで、確定値の反映・未登録商品/店舗の自動挿入を行い、確定版エクセルを出力します。")
+
+def parse_picking_pdf(file_bytes):
+    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    records = []
+    current_store_code = None
+    current_store_name = None
+    
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if "納入先：" in line:
+                m = re.search(r"納入先：\s*(\d+)\s*(.*)", line)
+                if m:
+                    current_store_code = str(int(m.group(1)))
+                    current_store_name = m.group(2).strip()
+            
+            m_item = re.match(r"^(\d{8})\s+(.*)", line)
+            if m_item and current_store_code:
+                item_code = str(int(m_item.group(1)))
+                item_name = m_item.group(2).strip()
+                price, qty = None, None
+                for step in range(1, 4):
+                    if i + step < len(lines):
+                        nxt = lines[i + step]
+                        m_price = re.search(r"[ー-]\s*\d+\s*([\d,]+)", nxt)
+                        if m_price and price is None:
+                            price = int(m_price.group(1).replace(",", ""))
+                        elif nxt.isdigit() and qty is None:
+                            qty = int(nxt)
+                if qty is not None:
+                    records.append({
+                        "store_code": current_store_code,
+                        "store_name": current_store_name,
+                        "item_code": item_code,
+                        "item_name": item_name,
+                        "price": price if price else 0,
+                        "qty": qty
+                    })
+            i += 1
+    return pd.DataFrame(records)
+
+def process_data(excel_file, apita_pdf, donki_pdf):
+    try:
+        wb = openpyxl.load_workbook(excel_file, data_only=False)
+    except Exception:
+        excel_file.seek(0)
+        xls_all = pd.read_excel(excel_file, sheet_name=None, header=None)
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        for s_name, s_df in xls_all.items():
+            new_ws = wb.create_sheet(title=s_name)
+            for r_row in s_df.itertuples(index=False):
+                new_ws.append(list(r_row))
+    
+    date_sheet_name = None
+    for name in wb.sheetnames:
+        if name != "ルート":
+            date_sheet_name = name
+            break
+    ws = wb[date_sheet_name]
+    
+    df_apita = parse_picking_pdf(apita_pdf.read())
+    df_donki = parse_picking_pdf(donki_pdf.read())
+    df_pdf = pd.concat([df_apita, df_donki], ignore_index=True)
+    df_pdf = df_pdf.drop_duplicates(subset=["store_code", "item_code"], keep="last")
+    
+    store_col_map = {}
+    total_col_idx = None
+    for c in range(5, ws.max_column + 1):
+        v1 = ws.cell(1, c).value
+        v2 = ws.cell(2, c).value
+        if str(v2).strip() == "総計":
+            total_col_idx = c
+            break
+        if v1 is not None and str(v1).strip() != "":
+            try:
+                sc = str(int(float(str(v1).strip())))
+                store_col_map[sc] = c
+            except:
+                pass
+                
+    if total_col_idx is None:
+        total_col_idx = ws.max_column + 1
+        ws.cell(2, total_col_idx).value = "総計"
+
+    item_row_map = {}
+    for r in range(3, ws.max_row + 1):
+        c_val = ws.cell(r, 2).value
+        if c_val is not None and str(c_val).strip() != "":
+            try:
+                ic = str(int(float(str(c_val).strip())))
+                item_row_map[ic] = r
+            except:
+                pass
+
+    added_stores_list = []
+    pdf_stores = df_pdf[["store_code", "store_name"]].drop_duplicates()
+    for _, s_row in pdf_stores.iterrows():
+        sc = s_row["store_code"]
+        if sc not in store_col_map:
+            ws.insert_cols(total_col_idx)
+            new_col = total_col_idx
+            ws.cell(1, new_col).value = sc
+            ws.cell(2, new_col).value = s_row["store_name"]
+            store_col_map[sc] = new_col
+            added_stores_list.append(f"{sc} ({s_row['store_name']})")
+            total_col_idx += 1
+
+    added_items_list = []
+    pdf_items = df_pdf[["item_code", "item_name", "price"]].drop_duplicates(subset=["item_code"])
+    current_last_row = ws.max_row
+    for _, i_row in pdf_items.iterrows():
+        ic = i_row["item_code"]
+        if ic not in item_row_map:
+            current_last_row += 1
+            ws.cell(current_last_row, 1).value = True
+            ws.cell(current_last_row, 2).value = ic
+            ws.cell(current_last_row, 3).value = i_row["item_name"]
+            ws.cell(current_last_row, 4).value = i_row["price"]
+            item_row_map[ic] = current_last_row
+            added_items_list.append(f"{ic} {i_row['item_name']}")
+
+    last_store_letter = get_column_letter(total_col_idx - 1)
+    for r in range(3, current_last_row + 1):
+        ws.cell(r, total_col_idx).value = f'=IF(AND(A{r}=TRUE,SUM(E{r}:{last_store_letter}{r})>0),SUM(E{r}:{last_store_letter}{r}),"")'
+
+    log_records = []
+    diff_count = 0
+    for _, row in df_pdf.iterrows():
+        sc = row["store_code"]
+        ic = row["item_code"]
+        pdf_qty = row["qty"]
+        r_idx = item_row_map.get(ic)
+        c_idx = store_col_map.get(sc)
+        
+        if r_idx and c_idx:
+            old_val = ws.cell(r_idx, c_idx).value
+            old_qty = int(old_val) if (old_val is not None and str(old_val).isdigit()) else 0
+            if old_qty != pdf_qty:
+                ws.cell(r_idx, c_idx).value = pdf_qty
+                diff_count += 1
+                log_records.append({
+                    "シート": date_sheet_name,
+                    "店舗コード": sc,
+                    "店舗名": ws.cell(2, c_idx).value,
+                    "商品コード": ic,
+                    "商品名": ws.cell(r_idx, 3).value,
+                    "修正前(予定)": old_qty,
+                    "修正後(確定)": pdf_qty,
+                    "増減": pdf_qty - old_qty
+                })
+
+    if "修正差分ログ" in wb.sheetnames:
+        del wb["修正差分ログ"]
+    ws_log = wb.create_sheet(title="修正差分ログ")
+    headers = ["シート", "店舗コード", "店舗名", "商品コード", "商品名", "修正前(予定)", "修正後(確定)", "増減"]
+    ws_log.append(headers)
+    for rec in log_records:
+        ws_log.append([rec[h] for h in headers])
+
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue(), diff_count, added_items_list, added_stores_list
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    f_excel = st.file_uploader("① 発注予定表 (.xls / .xlsx)", type=["xls", "xlsx"])
+with col2:
+    f_apita = st.file_uploader("② アピタ ピッキング (.pdf)", type=["pdf"])
+with col3:
+    f_donki = st.file_uploader("③ ドンキ ピッキング (.pdf)", type=["pdf"])
+
+if f_excel and f_apita and f_donki:
+    st.markdown("---")
+    if st.button("🚀 突合処理を実行して確定版Excelを作成", type="primary", use_container_width=True):
+        with st.spinner("PDF解析・差分突合・未登録データの挿入を実行中..."):
+            out_bytes, diff_cnt, add_items, add_stores = process_data(f_excel, f_apita, f_donki)
+            st.success("🎉 突合処理が正常に完了しました！")
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("修正されたセル数", f"{diff_cnt} 件")
+            m2.metric("新規追加された商品", f"{len(add_items)} 件")
+            m3.metric("新規追加された店舗", f"{len(add_stores)} 店舗")
+            
+            if add_items:
+                with st.expander("🆕 追加された商品の詳細"):
+                    for itm in add_items:
+                        st.write(f"- {itm}")
+            if add_stores:
+                with st.expander("🏪 追加された店舗の詳細"):
+                    for st_name in add_stores:
+                        st.write(f"- {st_name}")
+            
+            st.download_button(
+                label="📥 【確定修正版】発注表.xlsx をダウンロード",
+                data=out_bytes,
+                file_name="【確定修正版】発注表.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
