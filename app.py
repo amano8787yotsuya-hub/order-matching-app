@@ -21,6 +21,7 @@ YELLOW_FILL = PatternFill(
 MEIRYO_FONT = Font(name="Meiryo UI", size=10)
 MEIRYO_HEADER_FONT = Font(name="Meiryo UI", size=10, bold=True)
 DIFF_NUM_FORMAT = '#,##0;[Red]-#,##0;""'
+DATE_FORMAT = "yyyy/mm/dd"
 
 
 # -------------------------------------------------------------
@@ -102,7 +103,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-  # 【改善1】既存シートのゴミを残さないよう、完全にシートを再作成
+  # 既存シートのゴミを残さないよう、日付・集約関連シートを初期化
   for sname in list(wb.sheetnames):
     if sname not in ["ルート", "店舗マスタ"]:
       del wb[sname]
@@ -121,10 +122,12 @@ def process_data(excel_file, apita_pdf, donki_pdf):
 
   ws = wb[date_sheet_name]
 
-  # 納品日の判定
+  # 納品日の判定（B1またはC1）
+  date_col_letter = "B"
   raw_date_val = ws.cell(1, 2).value
   if not raw_date_val:
     raw_date_val = ws.cell(1, 3).value
+    date_col_letter = "C"
 
   date_clean = str(raw_date_val)
   if " " in date_clean:
@@ -137,6 +140,10 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     is_thursday = target_dt.weekday() == 3
   except:
     is_thursday = False
+
+  # 日付セルの書式を「yyyy/mm/dd」に設定
+  ws.cell(1, 2).number_format = DATE_FORMAT
+  ws.cell(1, 3).number_format = DATE_FORMAT
 
   # ルートシートから配送区分を取得
   dist_map = {}
@@ -171,7 +178,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
       ):
         ws.cell(r, 1).value = True
 
-  ws.cell(1, 2).value = raw_date_val
   ws.freeze_panes = "E3"
 
   # PDFの解析とマージ
@@ -256,7 +262,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
       ws.cell(current_last_row, 3).value = i_row["item_name"]
       ws.cell(current_last_row, 4).value = i_row["price"]
 
-      # 【改善2】新商品行の店舗数量セル（E列〜総計前列）を確実にクリア
+      # 新商品行の店舗数量セル（E列〜総計前列）をクリア
       for cl in range(5, total_col_idx):
         ws.cell(current_last_row, cl).value = None
 
@@ -307,7 +313,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
           })
 
   # -------------------------------------------------------------
-  # 【改善3】修正差分ログシートの再構築（完全数式リンク ＆ 並び替え耐性）
+  # 修正差分ログシートの再構築（完全数式リンク ＆ 並び替え耐性）
   # -------------------------------------------------------------
   if "修正差分ログ" in wb.sheetnames:
     del wb["修正差分ログ"]
@@ -330,7 +336,6 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     sc_val = item["store_code"]
     st_name = item["store_name"]
 
-    # 日付シートの採用フラグ連動
     ws_log.cell(
         log_idx, 1
     ).value = f'=IF(\'{date_sheet_name}\'!$A{r_no}=TRUE, "{date_sheet_name}", "")'
@@ -350,15 +355,12 @@ def process_data(excel_file, apita_pdf, donki_pdf):
         log_idx, 6
     ).value = f"=IF('{date_sheet_name}'!$A{r_no}=TRUE, {item['old_qty']}, \"\")"
 
-    # G列（確定後）：日付シートの該当セルに直結リンク
-    # （※マクロの列並び替えCut&Insertでも自動追従します）
     ws_log.cell(log_idx, 7).value = (
         f"=IF('{date_sheet_name}'!$A{r_no}=TRUE,"
         f" IF('{date_sheet_name}'!{c_let}{r_no}=\"\", 0,"
         f" '{date_sheet_name}'!{c_let}{r_no}), \"\")"
     )
 
-    # H列（増減）：G列 - F列
     if item["old_qty"] == 0:
       ws_log.cell(
           log_idx, 8
@@ -374,13 +376,16 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   ws_log.auto_filter.ref = f"A1:H{max(ws_log.max_row, 2)}"
 
   # -------------------------------------------------------------
-  # 出荷集約シートの再構築
+  # 出荷集約シートの再構築（自社便／佐川便の確実な分岐）
   # -------------------------------------------------------------
   if "出荷集約" in wb.sheetnames:
     del wb["出荷集約"]
   ws_syukka = wb.create_sheet(title="出荷集約")
   ws_syukka.cell(1, 1).value = "【対象日付】"
-  ws_syukka.cell(1, 2).value = f"='{date_sheet_name}'!B1"
+  # 日付シートのC1（またはB1）をリンクし書式設定
+  ws_syukka.cell(1, 2).value = f"='{date_sheet_name}'!{date_col_letter}1"
+  ws_syukka.cell(1, 2).number_format = DATE_FORMAT
+
   ws_syukka.cell(2, 1).value = "【表示モード】"
   ws_syukka.cell(2, 2).value = "すべて表示"
 
@@ -412,12 +417,22 @@ def process_data(excel_file, apita_pdf, donki_pdf):
     ws_syukka.cell(
         idx, 4
     ).value = f"=IF(A{idx}=TRUE, '{date_sheet_name}'!D{r}, \"\")"
+
     for c in range(5, total_col_idx):
       col_letter = get_column_letter(c)
-      sc_key = (
-          str(ws.cell(1, c).value).strip() if ws.cell(1, c).value else ""
+      sc_key = str(ws.cell(1, c).value).strip() if ws.cell(1, c).value else ""
+      st_name_val = (
+          str(ws.cell(2, c).value).strip() if ws.cell(2, c).value else ""
       )
-      dist_target = dist_map.get(sc_key, "自社便のみ")
+
+      # 【修正点3】二重判定：店名に「宅」「佐川」が含まれるか、マスタで「佐川」なら佐川便
+      if "宅" in st_name_val or "佐川" in st_name_val:
+        dist_target = "佐川便のみ"
+      elif sc_key in dist_map:
+        dist_target = dist_map[sc_key]
+      else:
+        dist_target = "自社便のみ"
+
       ws_syukka.cell(idx, c).value = (
           f'=IF(AND(A{idx}=TRUE, \'{date_sheet_name}\'!$A{r}=TRUE,'
           f' OR($B$2="すべて表示", $B$2="{dist_target}"),'
@@ -435,13 +450,16 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   ws_syukka.views.sheetView[0].showZeros = False
 
   # -------------------------------------------------------------
-  # 商品別集計シートの再構築
+  # 商品別集計シートの再構築（新規追加商品完全反映 ＆ 日付書式）
   # -------------------------------------------------------------
   if "商品別集計" in wb.sheetnames:
     del wb["商品別集計"]
   ws_shouhin = wb.create_sheet(title="商品別集計")
   ws_shouhin.cell(1, 1).value = "【対象日付】"
-  ws_shouhin.cell(1, 2).value = f"='{date_sheet_name}'!B1"
+  # 【修正点2】日付シートのリンクおよび日付書式を適用
+  ws_shouhin.cell(1, 2).value = f"='{date_sheet_name}'!{date_col_letter}1"
+  ws_shouhin.cell(1, 2).number_format = DATE_FORMAT
+
   ws_shouhin.cell(3, 1).value = "商品コード"
   ws_shouhin.cell(3, 2).value = "商品名"
   ws_shouhin.cell(3, 3).value = "納品単価"
@@ -450,10 +468,19 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   ws_shouhin.cell(3, 6).value = "差異"
 
   total_col_letter = get_column_letter(total_col_idx)
+
+  # 【修正点1】最下行に追加された新規商品（current_last_row）まで確実にループ
   for idx, r in enumerate(range(3, current_last_row + 1), start=4):
     ic_val = ws.cell(r, 2).value
-    ic_str = str(int(float(str(ic_val)))) if ic_val else ""
+    ic_str = ""
+    if ic_val is not None and str(ic_val).strip() != "":
+      try:
+        ic_str = str(int(float(str(ic_val).strip())))
+      except:
+        ic_str = str(ic_val).strip()
+
     before_qty = orig_totals.get(ic_str, 0)
+
     ws_shouhin.cell(
         idx, 1
     ).value = (
@@ -484,9 +511,10 @@ def process_data(excel_file, apita_pdf, donki_pdf):
 
   ws_shouhin.freeze_panes = "A4"
   ws_shouhin.auto_filter.ref = f"A3:F{current_last_row + 1}"
-  ws_shouhin.views.sheetView[0].showZeros = False
+  # ゼロ値も確実に表示
+  ws_shouhin.views.sheetView[0].showZeros = True
 
-  # フォント・列幅統一
+  # 全シートのフォント・列幅統一
   for sheet_name in wb.sheetnames:
     target_ws = wb[sheet_name]
     for row in target_ws.iter_rows():
@@ -517,7 +545,9 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   return output.getvalue(), diff_count, added_items_list, added_stores_list
 
 
-# UI
+# -------------------------------------------------------------
+# 4. Streamlit UI
+# -------------------------------------------------------------
 col1, col2, col3 = st.columns(3)
 with col1:
   f_excel = st.file_uploader("① 発注予定表 (.xls / .xlsx)", type=["xls", "xlsx"])
