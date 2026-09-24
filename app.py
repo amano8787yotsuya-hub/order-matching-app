@@ -119,57 +119,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
 
   ws = wb[date_sheet_name]
 
-  # 納品日の判定
-  raw_date_val = ws.cell(3, 3).value  # C3
-  if not raw_date_val:
-    raw_date_val = ws.cell(1, 2).value  # B1
-  if not raw_date_val:
-    raw_date_val = ws.cell(1, 3).value  # C1
-
-  date_clean = str(raw_date_val)
-  if " " in date_clean:
-    date_clean = date_clean.split(" ")[0]
-  elif " " in date_clean:
-    date_clean = date_clean.split(" ")[0]
-
-  try:
-    target_dt = pd.to_datetime(date_clean)
-    is_thursday = target_dt.weekday() == 3
-  except:
-    is_thursday = False
-
-  # 日付セルの書式を「yyyy/mm/dd」に設定
-  ws.cell(1, 2).number_format = DATE_FORMAT
-  ws.cell(1, 3).number_format = DATE_FORMAT
-  ws.cell(3, 3).number_format = DATE_FORMAT
-
-  # ルートシートから配送区分を取得
-  dist_map = {}
-  ws_route = None
-  for r_name in ["ルート", "店舗マスタ"]:
-    if r_name in wb.sheetnames:
-      ws_route = wb[r_name]
-      break
-
-  if ws_route:
-    c_code = (
-        4 if (is_thursday and ws_route.cell(1, 4).value is not None) else 1
-    )
-    c_dist = (
-        6 if (is_thursday and ws_route.cell(1, 6).value is not None) else 3
-    )
-    for r in range(1, ws_route.max_row + 1):
-      sc_val = ws_route.cell(r, c_code).value
-      dist_val = ws_route.cell(r, c_dist).value
-      if sc_val is not None and str(sc_val).strip() != "":
-        try:
-          sc_k = str(int(float(str(sc_val).strip())))
-          dist_str = str(dist_val).strip() if dist_val else "自社"
-          dist_map[sc_k] = "佐川便のみ" if "佐川" in dist_str else "自社便のみ"
-        except:
-          pass
-
-  # A列に「採用」フラグがなければ挿入
+  # --- A列に「採用」フラグがなければ挿入 ---
   if ws.cell(2, 1).value != "採用":
     ws.insert_cols(1)
     ws.cell(2, 1).value = "採用"
@@ -179,6 +129,13 @@ def process_data(excel_file, apita_pdf, donki_pdf):
           and str(ws.cell(r, 2).value).strip() != ""
       ):
         ws.cell(r, 1).value = True
+
+  # --- 正しい位置に日付書式を設定（列挿入後の C1 セル） ---
+  ws.cell(1, 3).number_format = DATE_FORMAT
+
+  # --- D列（納品単価）は確実に数値書式に設定（D3の日付化バグを完全解消） ---
+  for r in range(3, ws.max_row + 1):
+    ws.cell(r, 4).number_format = "#,##0"
 
   ws.freeze_panes = "E3"
 
@@ -263,6 +220,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
       ws.cell(current_last_row, 2).value = ic
       ws.cell(current_last_row, 3).value = i_row["item_name"]
       ws.cell(current_last_row, 4).value = i_row["price"]
+      ws.cell(current_last_row, 4).number_format = "#,##0"
       for cl in range(5, total_col_idx):
         ws.cell(current_last_row, cl).value = None
       item_row_map[ic] = current_last_row
@@ -367,14 +325,14 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   ws_log.auto_filter.ref = f"A1:H{max(ws_log.max_row, 2)}"
 
   # -------------------------------------------------------------
-  # 出荷集約シートの再構築（日付をC3セルからリンク）
+  # 出荷集約シートの再構築（B1はC1からリンク、B2は完全動的判定）
   # -------------------------------------------------------------
   if "出荷集約" in wb.sheetnames:
     del wb["出荷集約"]
   ws_syukka = wb.create_sheet(title="出荷集約")
   ws_syukka.cell(1, 1).value = "【対象日付】"
-  # ご指定の C3 セルからリンク
-  ws_syukka.cell(1, 2).value = f"='{date_sheet_name}'!C3"
+  # 正しい C1 セル（日付）からリンク
+  ws_syukka.cell(1, 2).value = f"='{date_sheet_name}'!C1"
   ws_syukka.cell(1, 2).number_format = DATE_FORMAT
 
   ws_syukka.cell(2, 1).value = "【表示モード】"
@@ -395,6 +353,7 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   ws_syukka.cell(4, 4).value = "納品単価"
   ws_syukka.cell(4, total_col_idx).value = "総計"
 
+  # ★核心部分：各列の4行目の店名から「宅」の有無をExcel関数で動的判定
   for idx, r in enumerate(range(3, current_last_row + 1), start=5):
     ws_syukka.cell(
         idx, 1
@@ -411,22 +370,11 @@ def process_data(excel_file, apita_pdf, donki_pdf):
 
     for c in range(5, total_col_idx):
       col_letter = get_column_letter(c)
-      sc_key = str(ws.cell(1, c).value).strip() if ws.cell(1, c).value else ""
-      st_name_val = (
-          str(ws.cell(2, c).value).strip() if ws.cell(2, c).value else ""
-      )
-
-      # 二重判定：店名に「宅」「佐川」が含まれるか、マスタで「佐川」なら佐川便
-      if "宅" in st_name_val or "佐川" in st_name_val:
-        dist_target = "佐川便のみ"
-      elif sc_key in dist_map:
-        dist_target = dist_map[sc_key]
-      else:
-        dist_target = "自社便のみ"
-
+      # 4行目（店舗名）に「宅」があれば「佐川便のみ」、なければ「自社便のみ」と判定
       ws_syukka.cell(idx, c).value = (
           f'=IF(AND(A{idx}=TRUE, \'{date_sheet_name}\'!$A{r}=TRUE,'
-          f' OR($B$2="すべて表示", $B$2="{dist_target}"),'
+          f' OR($B$2="すべて表示", IF(ISNUMBER(FIND("宅",'
+          f' {col_letter}$4)), "佐川便のみ", "自社便のみ")=$B$2),'
           f" '{date_sheet_name}'!{col_letter}{r}>0),"
           f" '{date_sheet_name}'!{col_letter}{r}, \"\")"
       )
@@ -441,14 +389,14 @@ def process_data(excel_file, apita_pdf, donki_pdf):
   ws_syukka.views.sheetView[0].showZeros = False
 
   # -------------------------------------------------------------
-  # 商品別集計シートの再構築（日付をC3セルからリンク）
+  # 商品別集計シートの再構築（B1はC1からリンク）
   # -------------------------------------------------------------
   if "商品別集計" in wb.sheetnames:
     del wb["商品別集計"]
   ws_shouhin = wb.create_sheet(title="商品別集計")
   ws_shouhin.cell(1, 1).value = "【対象日付】"
-  # ご指定の C3 セルからリンク
-  ws_shouhin.cell(1, 2).value = f"='{date_sheet_name}'!C3"
+  # 正しい C1 セル（日付）からリンク
+  ws_shouhin.cell(1, 2).value = f"='{date_sheet_name}'!C1"
   ws_shouhin.cell(1, 2).number_format = DATE_FORMAT
 
   ws_shouhin.cell(3, 1).value = "商品コード"
